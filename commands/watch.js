@@ -59,6 +59,7 @@ export async function watch(numbers, options) {
         process.on('SIGINT', () => {
             running = false;
             console.log(chalk.yellow('\nStopping multi-target watch...'));
+            process.exit(0);
         });
 
         while (running && (infinite || probeCount < maxProbes)) {

@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import ora from 'ora';
-import { createConnectedSocket } from '../lib/client.js';
+import { createConnectedSocket, markShuttingDown } from '../lib/client.js';
 import { checkAuth, sleep, resolveTargetJid, sendDesktopNotification } from '../lib/utils.js';
 import { discoverDevices, sendProbe, formatStateBadge, renderRttBar, computeRttStats } from '../lib/probe.js';
 
@@ -20,28 +20,37 @@ export async function online(number, options) {
     );
 
     try {
-        const connectSpinner = ora('Connecting to WhatsApp...').start();
+        const connectSpinner = ora({ text: 'Connecting to WhatsApp...', discardStdin: false }).start();
         const sock = await createConnectedSocket();
         connectSpinner.succeed('Connected to WhatsApp');
 
-        const deviceSpinner = ora('Fetching linked devices...').start();
+        const deviceSpinner = ora({ text: 'Fetching linked devices...', discardStdin: false }).start();
         const resolved = await resolveTargetJid(sock, number);
         if (!resolved.exists) {
             deviceSpinner.fail(`Number ${number} is not registered on WhatsApp.`);
             process.exit(1);
         }
 
-        const devices = await discoverDevices(sock, resolved.jid);
+        let devices = await discoverDevices(sock, resolved.jid);
+        if (options.device !== undefined) {
+            const filterVal = String(options.device).toLowerCase();
+            devices = devices.filter(d =>
+                String(d.deviceId) === filterVal ||
+                d.label.toLowerCase().includes(filterVal)
+            );
+        }
+
         if (devices.length === 0) {
-            deviceSpinner.fail('No devices found for this number.');
+            deviceSpinner.fail('No matching devices found for this number.');
             process.exit(1);
         }
 
-        deviceSpinner.succeed(`Found ${devices.length} device(s) for ${resolved.jid}`);
+        deviceSpinner.succeed(`Monitoring ${devices.length} device(s) for ${resolved.jid}`);
         console.log(chalk.dim('─'.repeat(78)));
 
         let probeCount = 0;
         let running = true;
+        let activeSpinner = null;
         const allResults = [];
         const rttHistoryByDevice = new Map();
         const lastStateByDevice = new Map();
@@ -51,17 +60,39 @@ export async function online(number, options) {
             lastStateByDevice.set(d.label, null);
         });
 
-        process.on('SIGINT', () => {
+        const printSummaryAndExit = () => {
+            if (!running) return;
             running = false;
-            console.log(chalk.yellow('\nStopping monitor...'));
-        });
+            markShuttingDown();
+            if (activeSpinner) activeSpinner.stop();
+            console.log(chalk.dim('\n' + '═'.repeat(78)));
+            console.log(chalk.white.bold(`Session Summary for ${number} (${probeCount} probes)`));
+            console.log(chalk.dim('═'.repeat(78)));
+            for (const device of devices) {
+                const history = rttHistoryByDevice.get(device.label) || [];
+                const s = computeRttStats(history, history.length);
+                if (s.avg !== null) {
+                    console.log(
+                        `  ${chalk.cyan(device.label.padEnd(14))} -> ` +
+                        `Uptime: ${chalk.green(`${s.uptimePct}%`)} (${s.onlineCount}/${s.totalProbes}) | ` +
+                        `Avg: ${chalk.yellow(`${s.avg}ms`)} | Min: ${s.min}ms | Max: ${s.max}ms | Jitter: ±${s.jitter}ms`
+                    );
+                } else {
+                    console.log(`  ${chalk.cyan(device.label.padEnd(14))} -> Uptime: ${chalk.gray('0% (Offline all probes)')}`);
+                }
+            }
+            process.exit(0);
+        };
+
+        process.on('SIGINT', printSummaryAndExit);
+        process.on('SIGTERM', printSummaryAndExit);
 
         while (running && (infinite || probeCount < maxProbes)) {
             probeCount++;
             const nowStr = new Date().toLocaleTimeString('pt-BR', { hour12: false });
             console.log(chalk.cyan(`\n[Probe #${probeCount} @ ${nowStr}]`));
 
-            const spinner = ora({ text: 'Probing all devices...', spinner: 'dots' }).start();
+            activeSpinner = ora({ text: 'Probing devices...', spinner: 'dots', discardStdin: false }).start();
 
             const probePromises = devices.map(device =>
                 sendProbe(sock, device.probeJid).then(result => ({
@@ -74,7 +105,10 @@ export async function online(number, options) {
             );
 
             const results = await Promise.all(probePromises);
-            spinner.stop();
+            activeSpinner.stop();
+            activeSpinner = null;
+
+            if (!running) break;
 
             for (const result of results) {
                 const history = rttHistoryByDevice.get(result.device) || [];
@@ -84,7 +118,6 @@ export async function online(number, options) {
                 const stats = computeRttStats(history, probeCount);
                 const prevState = lastStateByDevice.get(result.device);
 
-                // Desktop notification on state transition
                 if (options.notify && prevState !== null && prevState !== result.state) {
                     if (prevState === 'OFFLINE' && result.state !== 'OFFLINE') {
                         sendDesktopNotification(
@@ -128,26 +161,7 @@ export async function online(number, options) {
             }
         }
 
-        // Print final session summary
-        console.log(chalk.dim('\n' + '═'.repeat(78)));
-        console.log(chalk.white.bold(`Session Summary for ${number} (${probeCount} probes)`));
-        console.log(chalk.dim('═'.repeat(78)));
-        for (const device of devices) {
-            const history = rttHistoryByDevice.get(device.label) || [];
-            const s = computeRttStats(history, probeCount);
-            if (s.avg !== null) {
-                console.log(
-                    `  ${chalk.cyan(device.label.padEnd(14))} -> ` +
-                    `Uptime: ${chalk.green(`${s.uptimePct}%`)} (${s.onlineCount}/${s.totalProbes}) | ` +
-                    `Avg: ${chalk.yellow(`${s.avg}ms`)} | Min: ${s.min}ms | Max: ${s.max}ms | Jitter: ±${s.jitter}ms`
-                );
-            } else {
-                console.log(`  ${chalk.cyan(device.label.padEnd(14))} -> Uptime: ${chalk.gray('0% (Offline all probes)')}`);
-            }
-        }
-
-        sock.end();
-        process.exit(0);
+        printSummaryAndExit();
     } catch (error) {
         console.error(chalk.red('Error in online check:'), error);
         process.exit(1);
@@ -157,11 +171,9 @@ export async function online(number, options) {
 function saveResults(number, results, dir) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    // Save JSON
     const jsonPath = path.join(dir, `online-rtt-${number}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(results, null, 2));
 
-    // Save CSV
     const csvPath = path.join(dir, `online-rtt-${number}.csv`);
     const header = 'iso_time,timestamp,target,device,device_id,state,client_rtt_ms,server_rtt_ms\n';
     const rows = results.map(r => [
