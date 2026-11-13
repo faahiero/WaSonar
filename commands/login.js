@@ -1,9 +1,8 @@
 import fs from 'fs';
-import path from 'path';
 import chalk from 'chalk';
 import ora from 'ora';
 import { connectToWhatsApp } from '../lib/client.js';
-import { getAccountName, getAuthDir, listAccounts, cleanPhoneNumber } from '../lib/utils.js';
+import { getAccountName, getAuthDir, getAccountsSummary, cleanPhoneNumber } from '../lib/utils.js';
 
 export async function login(options = {}) {
     const account = getAccountName();
@@ -14,7 +13,7 @@ export async function login(options = {}) {
     const phone = options.phone ? cleanPhoneNumber(options.phone) : null;
 
     try {
-        const spinner = ora('Connecting to WhatsApp...').start();
+        const spinner = ora({ text: 'Connecting to WhatsApp...', discardStdin: false }).start();
         let pairingCodeRequested = false;
 
         await new Promise((resolve, reject) => {
@@ -71,24 +70,17 @@ export async function logout() {
 }
 
 export async function accounts() {
-    const saved = listAccounts();
-    const active = getAccountName();
+    const saved = getAccountsSummary();
     console.log(chalk.white.bold('\nSaved WhatsApp Sessions (~/.wasonar/sessions)'));
     console.log(chalk.dim('─'.repeat(50)));
     if (saved.length === 0) {
         console.log(chalk.yellow('  No authenticated accounts found. Run `wasonar-cli login`.'));
     } else {
         for (const acc of saved) {
-            const credsPath = path.join(getAuthDir(acc), 'creds.json');
-            let meId = 'Unknown';
-            let meName = '';
-            try {
-                const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                meId = creds?.me?.id || 'Unknown';
-                meName = creds?.me?.name ? ` (${creds.me.name})` : '';
-            } catch {}
-            const marker = acc === active ? chalk.green('●') : chalk.gray('○');
-            console.log(`  ${marker} ${chalk.cyan.bold(acc.padEnd(14))} ${chalk.white(meId)}${chalk.dim(meName)}`);
+            const meId = acc.meId || 'Unknown';
+            const meName = acc.meName ? ` (${acc.meName})` : '';
+            const marker = acc.active ? chalk.green('●') : chalk.gray('○');
+            console.log(`  ${marker} ${chalk.cyan.bold(acc.name.padEnd(14))} ${chalk.white(meId)}${chalk.dim(meName)}`);
         }
     }
     console.log('');
