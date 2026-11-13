@@ -1,95 +1,121 @@
-import { connectToWhatsApp } from '../lib/client.js';
-import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import chalk from 'chalk';
-import { checkAuth, sleep } from '../lib/utils.js';
 import fs from 'fs';
 import path from 'path';
 import ora from 'ora';
+import { createConnectedSocket } from '../lib/client.js';
+import { checkAuth, sleep, resolveTargetJid, sendDesktopNotification } from '../lib/utils.js';
+import { discoverDevices, sendProbe, formatStateBadge, renderRttBar, computeRttStats } from '../lib/probe.js';
 
 export async function online(number, options) {
     checkAuth();
-    console.log(chalk.blue(`Checking online status for: ${number}`));
-    
-    const maxProbes = parseInt(options.probes, 10);
+    console.log(chalk.blue(`Checking online status & activity telemetry for: ${number}`));
+
+    const maxProbes = parseInt(options.probes, 10) || 0;
+    const intervalMs = parseInt(options.interval, 10) || 1000;
     const infinite = maxProbes === 0;
 
-    if (infinite) {
-        console.log(chalk.yellow(`Mode: Infinite Probes (Ctrl+C to stop)`));
-    } else {
-        console.log(chalk.yellow(`Mode: ${maxProbes} Probe(s)`));
-    }
+    console.log(
+        chalk.yellow(`Mode: ${infinite ? 'Infinite Probes (Ctrl+C to stop)' : `${maxProbes} Probe(s)`}`) +
+        chalk.dim(` | Interval: ${intervalMs}ms | Desktop Alerts: ${options.notify ? 'ON' : 'OFF'}`)
+    );
 
     try {
-        // Connect with spinner
         const connectSpinner = ora('Connecting to WhatsApp...').start();
-        const sock = await connectToWhatsApp();
-        
-        // Wait for connection
-        await new Promise(resolve => {
-            if (sock.ws.isOpen) return resolve();
-            sock.ev.on('connection.update', (u) => {
-                if (u.connection === 'open') resolve();
-            });
-        });
+        const sock = await createConnectedSocket();
         connectSpinner.succeed('Connected to WhatsApp');
 
-        // Fetch devices with spinner
-        const rawJid = jidNormalizedUser(`${number}@s.whatsapp.net`);
         const deviceSpinner = ora('Fetching linked devices...').start();
-        const [exists] = await sock.onWhatsApp(rawJid);
-        const mainJid = exists?.exists ? exists.jid : rawJid;
-        const devicesList = await sock.getUSyncDevices([mainJid], false, false);
+        const resolved = await resolveTargetJid(sock, number);
+        if (!resolved.exists) {
+            deviceSpinner.fail(`Number ${number} is not registered on WhatsApp.`);
+            process.exit(1);
+        }
 
-        if (!Array.isArray(devicesList) || devicesList.length === 0) {
+        const devices = await discoverDevices(sock, resolved.jid);
+        if (devices.length === 0) {
             deviceSpinner.fail('No devices found for this number.');
             process.exit(1);
         }
 
-        const devices = devicesList.map(d => ({
-            jid: d.jid,
-            deviceId: d.device,
-            isMain: d.device === 0,
-            label: d.device === 0 ? 'Phone' : `Companion ${d.device}`
-        }));
+        deviceSpinner.succeed(`Found ${devices.length} device(s) for ${resolved.jid}`);
+        console.log(chalk.dim('─'.repeat(78)));
 
-        deviceSpinner.succeed(`Found ${devices.length} device(s)`);
-        console.log(chalk.dim('─'.repeat(60)));
-
-        
         let probeCount = 0;
+        let running = true;
         const allResults = [];
+        const rttHistoryByDevice = new Map();
+        const lastStateByDevice = new Map();
 
-        // Main Loop
-        while (infinite || probeCount < maxProbes) {
+        devices.forEach(d => {
+            rttHistoryByDevice.set(d.label, []);
+            lastStateByDevice.set(d.label, null);
+        });
+
+        process.on('SIGINT', () => {
+            running = false;
+            console.log(chalk.yellow('\nStopping monitor...'));
+        });
+
+        while (running && (infinite || probeCount < maxProbes)) {
             probeCount++;
-            console.log(chalk.cyan(`\n[Probe ${probeCount}]`));
+            const nowStr = new Date().toLocaleTimeString('pt-BR', { hour12: false });
+            console.log(chalk.cyan(`\n[Probe #${probeCount} @ ${nowStr}]`));
 
-            // Create spinner
             const spinner = ora({ text: 'Probing all devices...', spinner: 'dots' }).start();
 
-            // Send probes in PARALLEL
-            const probePromises = devices.map(device => {
-                const probeJid = device.deviceId === 0 && !device.jid.includes(':') ? device.jid.replace('@', ':0@') : device.jid;
-                return sendProbe(sock, probeJid).then(result => ({ ...result, device: device.label }));
-            });
+            const probePromises = devices.map(device =>
+                sendProbe(sock, device.probeJid).then(result => ({
+                    ...result,
+                    target: number,
+                    jid: device.jid,
+                    device: device.label,
+                    deviceId: device.deviceId
+                }))
+            );
 
             const results = await Promise.all(probePromises);
             spinner.stop();
 
-            // Display results
             for (const result of results) {
-                process.stdout.write(`  ${result.device.padEnd(15)}: `);
-                if (result.error) {
-                    console.log(chalk.red(`Error - ${result.error}`));
-                } else {
-                    const isOnline = result.clientRtt !== null;
-                    const status = isOnline 
-                        ? chalk.green('ONLINE') 
-                        : chalk.gray('OFFLINE');
-                    
-                    const clientTime = result.clientRtt ? `${result.clientRtt}ms` : '-';
-                    console.log(`${status} (${clientTime})`);
+                const history = rttHistoryByDevice.get(result.device) || [];
+                history.push(result.clientRtt);
+                rttHistoryByDevice.set(result.device, history);
+
+                const stats = computeRttStats(history, probeCount);
+                const prevState = lastStateByDevice.get(result.device);
+
+                // Desktop notification on state transition
+                if (options.notify && prevState !== null && prevState !== result.state) {
+                    if (prevState === 'OFFLINE' && result.state !== 'OFFLINE') {
+                        sendDesktopNotification(
+                            `WaSonar: ${number} Online`,
+                            `${result.device} entrou ${result.state} (${result.clientRtt}ms)`
+                        );
+                    } else if (prevState !== 'OFFLINE' && result.state === 'OFFLINE') {
+                        sendDesktopNotification(
+                            `WaSonar: ${number} Offline`,
+                            `${result.device} ficou OFFLINE`
+                        );
+                    }
                 }
+                lastStateByDevice.set(result.device, result.state);
+
+                const labelCol = `  ${result.device.padEnd(14)}: `;
+                if (result.error) {
+                    console.log(`${labelCol}${formatStateBadge('ERROR')} ${chalk.red(result.error)}`);
+                } else {
+                    const badge = formatStateBadge(result.state);
+                    const rttText = result.clientRtt !== null
+                        ? chalk.white.bold(`${String(result.clientRtt).padStart(4)}ms`)
+                        : chalk.gray('   -  ');
+                    const bar = renderRttBar(result.clientRtt, 10);
+                    const statsText = stats.avg !== null
+                        ? chalk.dim(`avg:${stats.avg}ms min:${stats.min}ms max:${stats.max}ms jit:±${stats.jitter}ms up:${stats.uptimePct}%`)
+                        : chalk.dim(`up:0%`);
+
+                    console.log(`${labelCol}${badge} ${rttText} ${bar}  ${statsText}`);
+                }
+
                 allResults.push(result);
             }
 
@@ -97,140 +123,56 @@ export async function online(number, options) {
                 saveResults(number, allResults, options.output);
             }
 
-            await sleep(1000);
+            if (running && (infinite || probeCount < maxProbes)) {
+                await sleep(intervalMs);
+            }
         }
 
-        console.log(chalk.blue('\nProbing finished.'));
-        process.exit(0);
+        // Print final session summary
+        console.log(chalk.dim('\n' + '═'.repeat(78)));
+        console.log(chalk.white.bold(`Session Summary for ${number} (${probeCount} probes)`));
+        console.log(chalk.dim('═'.repeat(78)));
+        for (const device of devices) {
+            const history = rttHistoryByDevice.get(device.label) || [];
+            const s = computeRttStats(history, probeCount);
+            if (s.avg !== null) {
+                console.log(
+                    `  ${chalk.cyan(device.label.padEnd(14))} -> ` +
+                    `Uptime: ${chalk.green(`${s.uptimePct}%`)} (${s.onlineCount}/${s.totalProbes}) | ` +
+                    `Avg: ${chalk.yellow(`${s.avg}ms`)} | Min: ${s.min}ms | Max: ${s.max}ms | Jitter: ±${s.jitter}ms`
+                );
+            } else {
+                console.log(`  ${chalk.cyan(device.label.padEnd(14))} -> Uptime: ${chalk.gray('0% (Offline all probes)')}`);
+            }
+        }
 
+        sock.end();
+        process.exit(0);
     } catch (error) {
         console.error(chalk.red('Error in online check:'), error);
         process.exit(1);
     }
 }
 
-
-
-async function sendProbe(sock, targetJid) {
-    const startTime = Date.now();
-    
-    // Generate fake message ID (the one we're "deleting")
-    const fakeId = `PROBE_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    const fakeKey = {
-        remoteJid: targetJid,
-        fromMe: true,
-        id: fakeId
-    };
-
-    let serverAckTime = null;
-    let clientAckTime = null;
-    let resolved = false;
-    let deleteMessageId = null; // The ACTUAL message ID of the delete request
-
-    // Helper: Normalize status
-    const getStatus = (s) => {
-        if (typeof s === 'number') return s;
-        if (s === 'SERVER_ACK') return 2;
-        if (s === 'DELIVERY_ACK') return 3;
-        if (s === 'READ') return 4;
-        return 0;
-    };
-
-    // Listener: Update (tracks the DELETE message ID)
-    const updateHandler = (updates) => {
-        if (resolved) return;
-        for (const u of updates) {
-            // Match against the actual delete message ID, not the fake one
-            if (deleteMessageId && u.key.id === deleteMessageId) {
-                const rawStatus = u.update.status;
-                const status = getStatus(rawStatus);
-                
-                if (status === 2 && !serverAckTime) {
-                    serverAckTime = Date.now();
-                }
-                if (status >= 3 && !clientAckTime) {
-                    clientAckTime = Date.now();
-                    resolved = true;
-                }
-            }
-        }
-    };
-
-    // Listener: Upsert (Catches the REVOKE message itself)
-    const upsertHandler = (event) => {
-        if (resolved) return;
-        const msg = event.messages?.[0];
-        if (!msg) return;
-
-        // Check if it's our own REVOKE message
-        const isRevoke = msg.message?.protocolMessage?.type === 'REVOKE' || 
-                         msg.message?.protocolMessage?.type === 0;
-        const targetId = msg.message?.protocolMessage?.key?.id;
-
-        if (msg.key.fromMe && isRevoke && targetId === fakeId) {
-            // Capture the real delete message ID
-            if (!deleteMessageId) {
-                deleteMessageId = msg.key.id;
-            }
-
-            const rawStatus = msg.status;
-            const status = getStatus(rawStatus);
-
-            if (status === 2 && !serverAckTime) {
-                serverAckTime = Date.now();
-            }
-            if (status >= 3 && !clientAckTime) {
-                clientAckTime = Date.now();
-                resolved = true;
-            }
-        }
-    };
-
-    sock.ev.on('messages.update', updateHandler);
-    sock.ev.on('messages.upsert', upsertHandler);
-
-    try {
-        const sent = await sock.sendMessage(targetJid, { delete: fakeKey });
-        
-        // Capture the delete message ID from the response
-        if (sent?.key?.id) {
-            deleteMessageId = sent.key.id;
-        }
-
-        // Record server RTT from sendMessage completion if not already set
-        if (!serverAckTime) {
-            serverAckTime = Date.now();
-        }
-
-        // Wait for delivery ack (up to 5 seconds)
-        const waitStart = Date.now();
-        while (!resolved && (Date.now() - waitStart) < 5000) {
-            await sleep(50);
-        }
-
-    } catch (e) {
-        console.error(chalk.red('Send error:'), e);
-        sock.ev.off('messages.update', updateHandler);
-        sock.ev.off('messages.upsert', upsertHandler);
-        return { error: e.message };
-    }
-
-    sock.ev.off('messages.update', updateHandler);
-    sock.ev.off('messages.upsert', upsertHandler);
-
-    return {
-        timestamp: startTime,
-        serverRtt: serverAckTime ? (serverAckTime - startTime) : null,
-        clientRtt: clientAckTime ? (clientAckTime - startTime) : null
-    };
-}
-
-
-
 function saveResults(number, results, dir) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(
-        path.join(dir, `online-rtt-${number}.json`), 
-        JSON.stringify(results, null, 2)
-    );
+
+    // Save JSON
+    const jsonPath = path.join(dir, `online-rtt-${number}.json`);
+    fs.writeFileSync(jsonPath, JSON.stringify(results, null, 2));
+
+    // Save CSV
+    const csvPath = path.join(dir, `online-rtt-${number}.csv`);
+    const header = 'iso_time,timestamp,target,device,device_id,state,client_rtt_ms,server_rtt_ms\n';
+    const rows = results.map(r => [
+        new Date(r.timestamp).toISOString(),
+        r.timestamp,
+        r.target,
+        `"${r.device}"`,
+        r.deviceId,
+        r.state,
+        r.clientRtt ?? '',
+        r.serverRtt ?? ''
+    ].join(',')).join('\n');
+    fs.writeFileSync(csvPath, header + rows + '\n');
 }
