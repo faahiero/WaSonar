@@ -14,6 +14,8 @@ import {
     getAuthDir,
     removeAccountSession,
     getAccountsSummary,
+    getRecentTargets,
+    removeRecentTarget,
     cleanPhoneNumber,
     resolveTargetJid,
     sendDesktopNotification
@@ -370,10 +372,27 @@ export async function web(options) {
             res.write(`event: init\ndata: ${JSON.stringify({
                 monitor: monitorState,
                 watch: watchState,
-                auth: { ...authStatus, accounts: getAccountsSummary() }
+                auth: { ...authStatus, accounts: getAccountsSummary() },
+                recentTargets: getRecentTargets()
             })}\n\n`);
             sseClients.add(res);
             req.on('close', () => sseClients.delete(res));
+            return;
+        }
+
+        // Recent Targets API
+        if (pathname === '/api/recent' && req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ recentTargets: getRecentTargets() }));
+            return;
+        }
+
+        if (pathname === '/api/recent/delete' && req.method === 'POST') {
+            const number = parsedUrl.searchParams.get('number') || null;
+            const updated = removeRecentTarget(number);
+            broadcast('recent', updated);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, recentTargets: updated }));
             return;
         }
 
@@ -498,6 +517,8 @@ export async function web(options) {
                     }
                 }
 
+                broadcast('recent', getRecentTargets());
+
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     number: resolved.number,
@@ -557,6 +578,7 @@ export async function web(options) {
                     monitorState.lastStateByDevice[d.label] = null;
                 });
                 broadcast('status', { running: true, number: resolved.number, jid: resolved.jid, devices });
+                broadcast('recent', getRecentTargets());
                 runProbeCycle();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: true, jid: resolved.jid, devices }));
@@ -632,6 +654,7 @@ export async function web(options) {
                     samples: []
                 };
                 broadcast('watch_status', { running: true, numbers: watchState.numbers });
+                broadcast('recent', getRecentTargets());
                 runWatchCycle();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: true, targets: watchState.numbers }));
@@ -956,6 +979,44 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     display: inline-block;
     margin-top: 12px;
   }
+  .recent-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: -8px 0 16px 0;
+    padding: 8px 12px;
+    background: rgba(17, 24, 39, 0.65);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 12px;
+  }
+  .recent-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 999px;
+    padding: 4px 10px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .recent-chip:hover {
+    border-color: var(--accent);
+    background: rgba(0, 240, 255, 0.08);
+  }
+  .recent-chip .del-x {
+    color: var(--muted);
+    font-weight: 700;
+    padding: 0 2px;
+    border-radius: 4px;
+  }
+  .recent-chip .del-x:hover {
+    color: var(--red);
+  }
 </style>
 </head>
 <body>
@@ -999,6 +1060,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <button class="secondary" onclick="exportProbeData('csv')">Export CSV</button>
       </div>
     </div>
+
+    <div id="recentProbeBar" class="recent-bar" style="display:none;"></div>
 
     <div class="grid">
       <div class="card">
@@ -1050,6 +1113,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       </label>
       <button class="secondary" style="margin-left:auto;" onclick="exportWatchJson()">Export Watch JSON</button>
     </div>
+
+    <div id="recentWatchBar" class="recent-bar" style="display:none;"></div>
 
     <div class="card">
       <div class="co-banner">
@@ -1112,12 +1177,67 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <script>
   const samples = [];
   const watchSamples = [];
+  let recentTargets = [];
   let lastProfileData = null;
   let knownDevices = [];
   let selectedDevice = null;
   let isProbeRunning = false;
   let isWatchRunning = false;
   const colors = ['#00f0ff', '#10b981', '#f59e0b', '#a855f7', '#ec4899'];
+
+  function renderRecentBars(list) {
+    if (Array.isArray(list)) {
+      recentTargets = list;
+    }
+    const probeBar = document.getElementById('recentProbeBar');
+    const watchBar = document.getElementById('recentWatchBar');
+
+    if (!recentTargets.length) {
+      probeBar.style.display = 'none';
+      watchBar.style.display = 'none';
+      return;
+    }
+
+    probeBar.style.display = 'flex';
+    probeBar.innerHTML = '<span style="color:var(--muted);font-weight:600;">Recent Targets:</span>' +
+      recentTargets.map(item =>
+        '<span class="recent-chip" onclick="selectRecentProbe(\\'' + item.number + '\\')" title="Click to select ' + item.number + '">' +
+          '<span>' + item.number + '</span>' +
+          '<span class="del-x" onclick="event.stopPropagation(); deleteRecentTarget(\\'' + item.number + '\\')" title="Remove from history">×</span>' +
+        '</span>'
+      ).join('') +
+      '<button class="secondary" style="margin-left:auto;padding:3px 8px;font-size:11px;" onclick="deleteRecentTarget(\\'\\')">Clear History</button>';
+
+    watchBar.style.display = 'flex';
+    watchBar.innerHTML = '<span style="color:var(--muted);font-weight:600;">Click to add/remove from Watch:</span>' +
+      recentTargets.map(item =>
+        '<span class="recent-chip" onclick="toggleRecentWatch(\\'' + item.number + '\\')">' +
+          '<span>+ ' + item.number + '</span>' +
+        '</span>'
+      ).join('');
+  }
+
+  function selectRecentProbe(num) {
+    const input = document.getElementById('numInput');
+    input.value = num;
+    input.focus();
+  }
+
+  function toggleRecentWatch(num) {
+    const input = document.getElementById('watchNumsInput');
+    const parts = input.value.split(/[\\s,;]+/).map(s => s.trim()).filter(Boolean);
+    const idx = parts.indexOf(num);
+    if (idx >= 0) {
+      parts.splice(idx, 1);
+    } else {
+      parts.push(num);
+    }
+    input.value = parts.join(', ');
+  }
+
+  async function deleteRecentTarget(num) {
+    await fetch('/api/recent/delete?number=' + encodeURIComponent(num || ''), { method: 'POST' });
+  }
 
   function switchTab(tab) {
     for (const id of ['probe', 'watch', 'accounts']) {
@@ -1610,6 +1730,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
     if (init.monitor) updateToggleButton(Boolean(init.monitor.running));
     if (init.watch) updateWatchToggleButton(Boolean(init.watch.running));
+    if (init.recentTargets) renderRecentBars(init.recentTargets);
+  });
+
+  evtSource.addEventListener('recent', (e) => {
+    renderRecentBars(JSON.parse(e.data));
   });
 
   evtSource.addEventListener('auth', (e) => {
