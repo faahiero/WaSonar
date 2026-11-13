@@ -10,6 +10,22 @@ import { profile } from './commands/profile.js';
 import { watch } from './commands/watch.js';
 import { web } from './commands/web.js';
 import { setAccountName } from './lib/utils.js';
+import { execSync } from 'child_process';
+
+// Ensure terminal always has ISIG enabled so Ctrl+C generates SIGINT,
+// and also catch raw 0x03 (ETX / Ctrl+C) on stdin as a fallback.
+if (process.stdin.isTTY) {
+  try {
+    execSync('stty isig icanon echo', { stdio: ['inherit', 'ignore', 'ignore'] });
+  } catch {}
+  process.stdin.on('data', (chunk) => {
+    if (chunk && chunk.includes(0x03)) {
+      if (!process.emit('SIGINT', 'SIGINT')) {
+        process.exit(0);
+      }
+    }
+  });
+}
 
 const program = new Command();
 

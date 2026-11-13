@@ -457,8 +457,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <option value="3000">3.0s interval</option>
       </select>
       <button onclick="loadProfile()">Fetch OSINT Profile</button>
-      <button class="primary" onclick="startSonar()">Start Live Probe</button>
-      <button class="danger" onclick="stopSonar()">Stop</button>
+      <button id="probeToggleBtn" class="primary" onclick="toggleSonar()">Start Live Probe</button>
     </div>
   </header>
 
@@ -550,6 +549,31 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     ].join('');
   }
 
+  let isRunning = false;
+
+  function updateToggleButton(running) {
+    isRunning = running;
+    const btn = document.getElementById('probeToggleBtn');
+    const dot = document.getElementById('statusDot');
+    if (running) {
+      btn.textContent = 'Stop';
+      btn.className = 'danger';
+      dot.classList.add('running');
+    } else {
+      btn.textContent = 'Start Live Probe';
+      btn.className = 'primary';
+      dot.classList.remove('running');
+    }
+  }
+
+  async function toggleSonar() {
+    if (isRunning) {
+      await stopSonar();
+    } else {
+      await startSonar();
+    }
+  }
+
   async function startSonar() {
     const num = document.getElementById('numInput').value.trim();
     const interval = document.getElementById('intervalInput').value;
@@ -557,14 +581,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     samples.length = 0;
     selectedDevice = null;
     document.getElementById('logBody').innerHTML = '';
+    updateToggleButton(true);
     loadProfile();
-    await fetch('/api/start?number=' + encodeURIComponent(num) + '&interval=' + interval, { method: 'POST' });
-    document.getElementById('statusDot').classList.add('running');
+    const res = await fetch('/api/start?number=' + encodeURIComponent(num) + '&interval=' + interval, { method: 'POST' });
+    if (!res.ok) {
+      updateToggleButton(false);
+    }
   }
 
   async function stopSonar() {
+    updateToggleButton(false);
     await fetch('/api/stop', { method: 'POST' });
-    document.getElementById('statusDot').classList.remove('running');
   }
 
   function renderDeviceCards(cycleData) {
@@ -707,11 +734,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
 
   const evtSource = new EventSource('/api/events');
+  evtSource.addEventListener('init', (e) => {
+    const st = JSON.parse(e.data);
+    updateToggleButton(Boolean(st.running));
+  });
   evtSource.addEventListener('status', (e) => {
     const st = JSON.parse(e.data);
-    const dot = document.getElementById('statusDot');
-    if (st.running) dot.classList.add('running');
-    else dot.classList.remove('running');
+    updateToggleButton(Boolean(st.running));
   });
 
   evtSource.addEventListener('probe', (e) => {
