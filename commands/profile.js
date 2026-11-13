@@ -82,6 +82,13 @@ export async function profile(number, options) {
             devices = await discoverDevices(sock, canonicalJid);
         } catch {}
 
+        let resolvedLid = resolved.lid;
+        if (!resolvedLid) {
+            try {
+                resolvedLid = await sock.signalRepository?.lidMapping?.getLIDForPN?.(canonicalJid) || null;
+            } catch {}
+        }
+
         profileSpinner.succeed('OSINT Profile fetched');
         console.log('');
 
@@ -90,8 +97,8 @@ export async function profile(number, options) {
         console.log(chalk.dim('─'.repeat(56)));
         console.log(`${chalk.cyan('Input Number:')}   ${number}`);
         console.log(`${chalk.cyan('Canonical JID:')}  ${canonicalJid}`);
-        if (resolved.lid) {
-            console.log(`${chalk.cyan('Linked ID (LID):')} ${resolved.lid}`);
+        if (resolvedLid) {
+            console.log(`${chalk.cyan('Linked ID (LID):')} ${resolvedLid}`);
         }
         console.log(`${chalk.cyan('Account Type:')}   ${businessProfile ? chalk.magenta.bold('WhatsApp Business') : 'Standard Personal Account'}`);
         console.log(`${chalk.cyan('Status/About:')}   ${status || chalk.gray('(private/not set)')}`);
@@ -139,7 +146,7 @@ export async function profile(number, options) {
             const profileData = {
                 number,
                 jid: canonicalJid,
-                lid: resolved.lid,
+                lid: resolvedLid,
                 isBusiness: Boolean(businessProfile),
                 status,
                 statusSetAt,

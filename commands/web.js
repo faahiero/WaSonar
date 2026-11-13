@@ -481,19 +481,28 @@ export async function web(options) {
 
                 const devices = await discoverDevices(sock, canonicalJid);
 
+                let resolvedLid = resolved.lid;
+                if (!resolvedLid) {
+                    try {
+                        resolvedLid = await sock.signalRepository?.lidMapping?.getLIDForPN?.(canonicalJid) || null;
+                    } catch {}
+                }
+
                 if (checkOnline && devices.length > 0) {
-                    const probeRes = await Promise.all(devices.map(d => sendProbe(sock, d.probeJid)));
-                    devices.forEach((d, idx) => {
-                        d.state = probeRes[idx].state;
-                        d.rtt = probeRes[idx].clientRtt;
-                    });
+                    for (const d of devices) {
+                        const res = await sendProbe(sock, d.probeJid);
+                        d.state = res.state;
+                        d.rtt = res.clientRtt;
+                        d.serverRtt = res.serverRtt ?? null;
+                        if (res.error) d.error = res.error;
+                    }
                 }
 
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     number: resolved.number,
                     jid: canonicalJid,
-                    lid: resolved.lid,
+                    lid: resolvedLid,
                     status,
                     statusSetAt,
                     profilePicUrl,
