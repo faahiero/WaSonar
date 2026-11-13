@@ -540,6 +540,29 @@ export async function web(options) {
             return;
         }
 
+        // Proxy WhatsApp CDN photo with inline JPEG headers instead of attachment;filename=file.enc
+        if (pathname === '/api/photo' && req.method === 'GET') {
+            const photoUrl = parsedUrl.searchParams.get('url') || '';
+            const num = (parsedUrl.searchParams.get('number') || 'target').replace(/[^\d]/g, '');
+            if (!photoUrl.startsWith('https://pps.whatsapp.net/')) {
+                res.writeHead(400, { 'Content-Type': 'text/plain' });
+                res.end('Invalid photo URL');
+                return;
+            }
+            https.get(photoUrl, (upstream) => {
+                res.writeHead(upstream.statusCode || 200, {
+                    'Content-Type': upstream.headers['content-type'] || 'image/jpeg',
+                    'Content-Disposition': `inline; filename="profile-${num}.jpg"`,
+                    'Cache-Control': 'public, max-age=3600'
+                });
+                upstream.pipe(res);
+            }).on('error', () => {
+                res.writeHead(502, { 'Content-Type': 'text/plain' });
+                res.end('Failed to fetch photo');
+            });
+            return;
+        }
+
         // Single-target Live Probe start/stop/filter
         if (pathname === '/api/start' && req.method === 'POST') {
             if (authStatus.state !== 'connected' || !sock) {
@@ -1434,7 +1457,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       '<div class="kv"><span>Status/About:</span> ' + (data.status || '(private/none)') + '</div>',
       data.statusSetAt ? '<div class="kv"><span>Status Date:</span> ' + data.statusSetAt + '</div>' : '',
       data.photoLastModified ? '<div class="kv"><span>Photo Date:</span> ' + data.photoLastModified + (data.photoSizeKB ? ' (' + data.photoSizeKB + ' KB)' : '') + '</div>' : '',
-       data.profilePicUrl ? '<div style="margin:8px 0;"><a href="' + data.profilePicUrl + '" target="_blank" style="color:var(--accent);font-size:12px;">Open High-Res Photo ↗</a></div>' : '',
+      data.profilePicUrl ? '<div style="margin:8px 0;"><a href="/api/photo?url=' + encodeURIComponent(data.profilePicUrl) + '&number=' + encodeURIComponent(data.number) + '" target="_blank" style="color:var(--accent);font-size:12px;">Open High-Res Photo ↗</a></div>' : '',
       devsHtml,
       bizHtml
     ].join('');
