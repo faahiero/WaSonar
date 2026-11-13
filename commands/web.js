@@ -5,12 +5,14 @@ import { URL } from 'url';
 import { createRequire } from 'module';
 import chalk from 'chalk';
 import ora from 'ora';
-import { connectToWhatsApp, markShuttingDown } from '../lib/client.js';
+import { DisconnectReason } from '@whiskeysockets/baileys';
+import { connectToWhatsApp, markShuttingDown, closeActiveConnection } from '../lib/client.js';
 import {
     hasAuth,
     getAccountName,
     setAccountName,
     getAuthDir,
+    removeAccountSession,
     getAccountsSummary,
     cleanPhoneNumber,
     resolveTargetJid,
@@ -130,6 +132,8 @@ export async function web(options) {
     async function initAccountSession(accountName, loginOpts = {}) {
         stopMonitoring();
         stopWatch();
+        closeActiveConnection(sock);
+        sock = null;
         setAccountName(accountName);
         authStatus = {
             account: accountName,
@@ -146,7 +150,7 @@ export async function web(options) {
         try {
             await connectToWhatsApp(async (update, activeSock) => {
                 sock = activeSock;
-                const { connection, qr } = update;
+                const { connection, lastDisconnect, qr } = update;
 
                 if (qr) {
                     if (phone && !pairingRequested) {
@@ -179,8 +183,18 @@ export async function web(options) {
                 }
 
                 if (connection === 'close') {
-                    if (!hasAuth(accountName)) {
+                    const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+                    if (statusCode === DisconnectReason.loggedOut) {
+                        removeAccountSession(accountName);
                         authStatus.state = 'unauthenticated';
+                        authStatus.qrSvg = null;
+                        authStatus.pairingCode = null;
+                        authStatus.me = null;
+                        broadcast('auth', { ...authStatus, accounts: getAccountsSummary() });
+                    } else {
+                        authStatus.state = 'connecting';
+                        authStatus.qrSvg = null;
+                        authStatus.pairingCode = null;
                         broadcast('auth', { ...authStatus, accounts: getAccountsSummary() });
                     }
                 }
@@ -392,18 +406,17 @@ export async function web(options) {
 
         if (pathname === '/api/accounts/logout' && req.method === 'POST') {
             const name = parsedUrl.searchParams.get('name') || getAccountName();
-            const dir = getAuthDir(name);
             if (name === getAccountName()) {
                 stopMonitoring();
                 stopWatch();
-                try { sock?.end(); } catch {}
+                closeActiveConnection(sock);
+                sock = null;
                 authStatus.state = 'unauthenticated';
                 authStatus.me = null;
                 authStatus.qrSvg = null;
+                authStatus.pairingCode = null;
             }
-            if (fs.existsSync(dir)) {
-                fs.rmSync(dir, { recursive: true, force: true });
-            }
+            removeAccountSession(name);
             broadcast('auth', { ...authStatus, accounts: getAccountsSummary() });
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: true, accounts: getAccountsSummary() }));

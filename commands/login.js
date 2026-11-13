@@ -2,7 +2,7 @@ import fs from 'fs';
 import chalk from 'chalk';
 import ora from 'ora';
 import { connectToWhatsApp } from '../lib/client.js';
-import { getAccountName, getAuthDir, getAccountsSummary, cleanPhoneNumber } from '../lib/utils.js';
+import { getAccountName, getAuthDir, removeAccountSession, getAccountsSummary, cleanPhoneNumber } from '../lib/utils.js';
 
 export async function login(options = {}) {
     const account = getAccountName();
@@ -64,7 +64,7 @@ export async function logout() {
         console.log(chalk.yellow(`No saved session found for account "${account}".`));
         process.exit(0);
     }
-    fs.rmSync(authDir, { recursive: true, force: true });
+    removeAccountSession(account);
     console.log(chalk.green(`✔ Session removed for account "${account}" (${authDir}).`));
     process.exit(0);
 }
